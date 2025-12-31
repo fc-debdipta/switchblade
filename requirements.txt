@@ -1,0 +1,15 @@
+# Python 3.8+ required
+python>=3.8
+
+# Core dependencies (none required for basic functionality)
+# asyncio is part of standard library
+
+# Development dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+
+# Optional dependencies
+# black>=23.0.0  # Code formatting
+# mypy>=1.0.0    # Type checking
+# flake8>=6.0.0  # Linting
