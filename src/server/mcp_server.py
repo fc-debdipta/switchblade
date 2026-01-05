@@ -1,192 +1,194 @@
-"""
-MCP Server Implementation
-"""
-
-import asyncio
+import os
+import grpc
 import json
-import logging
-from typing import Dict, Any, Optional, Callable
-from datetime import datetime
+import time
+import importlib.util
+import sys
+import queue
+import threading
+import inspect  # <--- NEW: Needed to inspect module members
+from concurrent import futures
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+try:
+    from ..generated import switchblade_pb2
+    from ..generated import switchblade_pb2_grpc
+except ImportError:
+    # When running directly, add parent directory to path
+    sys.path.insert(
+        0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    )
+    from src.generated import switchblade_pb2
+    from src.generated import switchblade_pb2_grpc
+
+TOOLS_DIR = "./tools"
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class ToolRegistry:
+    def __init__(self):
+        self.tools = {}  # Maps tool_name -> function_object (not module)
+        self.subscribers = []
+        self.lock = threading.Lock()
 
+    def load_tool_file(self, filepath):
+        """Dynamically loads a python module and scans for @tool decorated functions."""
+        module_name = os.path.basename(filepath).replace(".py", "")
+        spec = importlib.util.spec_from_file_location(module_name, filepath)
 
-class MCPServer:
-    """
-    Model Context Protocol Server
-    
-    A flexible server implementation for handling MCP protocol requests,
-    managing context, and executing registered tools/functions.
-    """
-    
-    def __init__(self, host: str = "localhost", port: int = 8765):
-        """
-        Initialize the MCP Server
-        
-        Args:
-            host: Server host address
-            port: Server port number
-        """
-        self.host = host
-        self.port = port
-        self.tools: Dict[str, Callable] = {}
-        self.context: Dict[str, Any] = {}
-        self.server = None
-        
-    def register_tool(self, name: str, func: Callable, description: str = ""):
-        """
-        Register a tool/function that can be called by clients
-        
-        Args:
-            name: Tool name
-            func: Callable function
-            description: Tool description
-        """
-        self.tools[name] = {
-            "function": func,
-            "description": description
-        }
-        logger.info(f"Registered tool: {name}")
-        
-    def update_context(self, key: str, value: Any):
-        """
-        Update server context
-        
-        Args:
-            key: Context key
-            value: Context value
-        """
-        self.context[key] = value
-        logger.info(f"Updated context: {key}")
-        
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """
-        Handle individual client connections
-        
-        Args:
-            reader: Stream reader
-            writer: Stream writer
-        """
-        addr = writer.get_extra_info('peername')
-        logger.info(f"Client connected: {addr}")
-        
-        try:
-            while True:
-                data = await reader.read(4096)
-                if not data:
-                    break
-                    
-                message = json.loads(data.decode())
-                logger.info(f"Received request: {message.get('type', 'unknown')}")
-                
-                response = await self.process_request(message)
-                
-                writer.write(json.dumps(response).encode())
-                await writer.drain()
-                
-        except Exception as e:
-            logger.error(f"Error handling client {addr}: {e}")
-        finally:
-            logger.info(f"Client disconnected: {addr}")
-            writer.close()
-            await writer.wait_closed()
-            
-    async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process incoming requests
-        
-        Args:
-            request: Request dictionary
-            
-        Returns:
-            Response dictionary
-        """
-        request_type = request.get("type")
-        
-        if request_type == "ping":
-            return {"status": "success", "message": "pong", "timestamp": datetime.utcnow().isoformat()}
-            
-        elif request_type == "list_tools":
-            tools_list = {
-                name: {"description": tool["description"]}
-                for name, tool in self.tools.items()
-            }
-            return {"status": "success", "tools": tools_list}
-            
-        elif request_type == "call_tool":
-            tool_name = request.get("tool")
-            args = request.get("args", {})
-            
-            if tool_name not in self.tools:
-                return {"status": "error", "message": f"Tool '{tool_name}' not found"}
-                
+        if spec and spec.loader:
             try:
-                result = await self._execute_tool(tool_name, args)
-                return {"status": "success", "result": result}
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+
+                # --- NEW LOGIC: SCAN FOR DECORATED FUNCTIONS ---
+                loaded_count = 0
+                for name, obj in inspect.getmembers(module):
+                    # Check if it's a function and has our specific tag
+                    if inspect.isfunction(obj) and getattr(
+                        obj, "_is_switchblade_tool", False
+                    ):
+                        meta = obj._tool_metadata
+                        tool_name = meta["name"]
+
+                        with self.lock:
+                            # Register the function object directly
+                            self.tools[tool_name] = obj
+                            print(
+                                f"✅ Registered tool: {tool_name} (from {module_name})"
+                            )
+                            self.notify_subscribers(f"Tool '{tool_name}' updated")
+                            loaded_count += 1
+
+                if loaded_count == 0:
+                    print(f"⚠️  No tools found in {module_name} (Did you forget @tool?)")
+
             except Exception as e:
-                return {"status": "error", "message": str(e)}
-                
-        elif request_type == "get_context":
-            return {"status": "success", "context": self.context}
-            
-        else:
-            return {"status": "error", "message": f"Unknown request type: {request_type}"}
-            
-    async def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
-        """
-        Execute a registered tool
-        
-        Args:
-            tool_name: Name of the tool to execute
-            args: Arguments for the tool
-            
-        Returns:
-            Tool execution result
-        """
-        func = self.tools[tool_name]["function"]
-        
-        if asyncio.iscoroutinefunction(func):
-            return await func(**args)
-        else:
-            return func(**args)
-            
-    async def start(self):
-        """Start the MCP server"""
-        self.server = await asyncio.start_server(
-            self.handle_client, self.host, self.port
-        )
-        
-        addr = self.server.sockets[0].getsockname()
-        logger.info(f"MCP Server started on {addr}")
-        
-        async with self.server:
-            await self.server.serve_forever()
-            
-    async def stop(self):
-        """Stop the MCP server"""
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-            logger.info("MCP Server stopped")
+                print(f"❌ Failed to load {module_name}: {e}")
+
+    def notify_subscribers(self, message):
+        active_subs = []
+        for q in self.subscribers:
+            try:
+                q.put(
+                    switchblade_pb2.ToolsNotification(
+                        event_type="UPDATED", message=message
+                    )
+                )
+                active_subs.append(q)
+            except:
+                pass
+        self.subscribers = active_subs
+
+    def register_subscriber(self, q):
+        with self.lock:
+            self.subscribers.append(q)
+
+    def remove_subscriber(self, q):
+        with self.lock:
+            if q in self.subscribers:
+                self.subscribers.remove(q)
 
 
-async def main():
-    """Main entry point for running the server"""
-    server = MCPServer()
-    
-    # Example tool registration
-    def example_tool(text: str) -> str:
-        return f"Processed: {text}"
-    
-    server.register_tool("example", example_tool, "An example tool")
-    
+class ToolFileHandler(FileSystemEventHandler):
+    def __init__(self, registry):
+        self.registry = registry
+
+    def on_modified(self, event):
+        if event.src_path.endswith(".py"):
+            self.registry.load_tool_file(event.src_path)
+
+    def on_created(self, event):
+        if event.src_path.endswith(".py"):
+            self.registry.load_tool_file(event.src_path)
+
+
+class SwitchbladeServiceImpl(switchblade_pb2_grpc.SwitchbladeServiceServicer):
+    def __init__(self, registry):
+        self.registry = registry
+
+    def ListTools(self, request, context):
+        tool_list = []
+        with self.registry.lock:
+            for name, func_obj in self.registry.tools.items():
+                # Extract metadata from the function object
+                meta = func_obj._tool_metadata
+
+                tool_list.append(
+                    switchblade_pb2.Tool(
+                        name=meta["name"],
+                        description=meta["description"],
+                        input_schema_json=json.dumps(meta["input_schema"]),
+                        output_schema_json=json.dumps(meta["output_schema"]),
+                    )
+                )
+        return switchblade_pb2.ListToolsResponse(tools=tool_list)
+
+    def CallTool(self, request, context):
+        # Retrieve the function directly
+        tool_func = self.registry.tools.get(request.tool_name)
+
+        if not tool_func:
+            return switchblade_pb2.CallToolResponse(
+                is_error=True, error_message=f"Tool '{request.tool_name}' not found"
+            )
+
+        try:
+            args = json.loads(request.arguments_json) if request.arguments_json else {}
+
+            # --- EXECUTE THE FUNCTION DIRECTLY ---
+            result = tool_func(args)
+
+            return switchblade_pb2.CallToolResponse(
+                content_json=json.dumps(result), is_error=False
+            )
+        except Exception as e:
+            return switchblade_pb2.CallToolResponse(is_error=True, error_message=str(e))
+
+    def WatchTools(self, request, context):
+        q = queue.Queue()
+        self.registry.register_subscriber(q)
+        try:
+            while context.is_active():
+                notification = q.get()
+                yield notification
+        except Exception:
+            pass
+        finally:
+            self.registry.remove_subscriber(q)
+
+
+def serve():
+    registry = ToolRegistry()
+
+    if not os.path.exists(TOOLS_DIR):
+        os.makedirs(TOOLS_DIR)
+
+    for filename in os.listdir(TOOLS_DIR):
+        if filename.endswith(".py"):
+            registry.load_tool_file(os.path.join(TOOLS_DIR, filename))
+
+    observer = Observer()
+    observer.schedule(ToolFileHandler(registry), path=TOOLS_DIR, recursive=False)
+    observer.start()
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    switchblade_pb2_grpc.add_SwitchbladeServiceServicer_to_server(
+        SwitchbladeServiceImpl(registry), server
+    )
+
+    server.add_insecure_port("[::]:50051")
+    print("🚀 Switchblade Server running on port 50051...")
+
     try:
-        await server.start()
+        server.start()
+        server.wait_for_termination()
     except KeyboardInterrupt:
-        await server.stop()
+        observer.stop()
+        server.stop(0)
+    observer.join()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    serve()
