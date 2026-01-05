@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package switchblade;
+
+service SwitchbladeService {
+  rpc ListTools (Empty) returns (ListToolsResponse);
+  rpc CallTool (CallToolRequest) returns (CallToolResponse);
+  rpc WatchTools (Empty) returns (stream ToolsNotification);
+}
+
+message Empty {}
+
+message Tool {
+  string name = 1;
+  string description = 2;
+  string input_schema_json = 3;
+  string output_schema_json = 4; // <--- NEW FIELD
+}
+
+message ListToolsResponse {
+  repeated Tool tools = 1;
+}
+
+message CallToolRequest {
+  string tool_name = 1;
+  string arguments_json = 2;
+}
+
+message CallToolResponse {
+  string content_json = 1;
+  bool is_error = 2;
+  string error_message = 3;
+}
+
+message ToolsNotification {
+  string event_type = 1;
+  string message = 2;
+}
